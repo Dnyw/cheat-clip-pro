@@ -166,10 +166,10 @@ Kembalikan HANYA JSON valid dengan bentuk:
 
   onProgress?.('Mengirim audio langsung ke Gemini (tanpa server Cheat Clip Pro)...');
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey.trim() },
       signal,
       body: JSON.stringify({
         contents: [{
