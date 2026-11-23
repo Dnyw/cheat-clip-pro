@@ -4,6 +4,7 @@ import { LanguageSwitcher } from './components/LanguageSwitcher';
 import { resilientFetch } from './utils/api';
 import { getStoredCookies, hasStoredCookies } from './utils/cookieUtils';
 import { extractAudioFromVideoClient } from './utils/audioExtractor';
+import { analyzeLocalAudioWithGemini } from './services/localGeminiAudio';
 import { renderClipClientSide, triggerBrowserDownload } from './services/clientRenderer';
 import { renderClipWebCodecs, isWebCodecsGpuSupported } from './services/webcodecsRenderer';
 import { buildCaptionChunksForClip } from './services/captionUtils';
@@ -2329,77 +2330,35 @@ export default function App() {
       setOverallProgress(5);
       setActiveProcessingModel(selectedModel);
 
+      let localAudioFile: File | null = null;
       if (!currentVideoInfo && uploadedVideoFile) {
         setIsUploadingVideo(true);
-        setLoadingDetails(t.form.uploadingVideo);
-        setAiStage('Extracting Audio for AI');
-        setAiDetail(`Extracting lightweight audio track in browser from ${uploadedVideoFile.name}...`);
+        setLoadingDetails('Membaca video lokal...');
+        setAiStage('Extracting Audio Locally');
+        setAiDetail('Audio diproses di perangkat. Tidak ada file yang diunggah ke server aplikasi.');
 
         try {
-          const { audioFile, metadata } = await extractAudioFromVideoClient(uploadedVideoFile, (stage) => {
+          const extracted = await extractAudioFromVideoClient(uploadedVideoFile, (stage) => {
             setAiDetail(stage);
           });
-
-          setAiStage('Uploading AI Audio');
-          setAiDetail(`Uploading compressed audio track (${(audioFile.size / (1024 * 1024)).toFixed(1)} MB)...`);
-
-          // Upload lightweight audio file (.wav) to /api/upload-video
-          const upData = await new Promise<any>((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/upload-video');
-            xhr.upload.onprogress = (event) => {
-              if (event.lengthComputable && event.total > 0) {
-                const pct = Math.round((event.loaded / event.total) * 100);
-                const loadedMb = (event.loaded / (1024 * 1024)).toFixed(1);
-                const totalMb = (event.total / (1024 * 1024)).toFixed(1);
-                setAiDetail(`Uploading audio track (${pct}% - ${loadedMb}/${totalMb} MB)...`);
-                setStepProgress(prev => ({ ...prev, 1: Math.min(95, pct) }));
-              }
-            };
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) {
-                try {
-                  resolve(JSON.parse(xhr.responseText));
-                } catch {
-                  reject(new Error('Invalid JSON response from upload server'));
-                }
-              } else {
-                try {
-                  const errJson = JSON.parse(xhr.responseText);
-                  reject(new Error(errJson.detail || 'Failed to upload audio file'));
-                } catch {
-                  reject(new Error(`Upload failed with status code ${xhr.status}`));
-                }
-              }
-            };
-            xhr.onerror = () => reject(new Error('Network error during audio upload'));
-            xhr.onabort = () => reject(new Error('Audio upload cancelled'));
-
-            const formData = new FormData();
-            formData.append('file', audioFile);
-            formData.append('client_duration', String(metadata.duration || 0));
-            formData.append('client_width', String(metadata.width || 1920));
-            formData.append('client_height', String(metadata.height || 1080));
-            formData.append('original_filename', uploadedVideoFile.name);
-            xhr.send(formData);
-          });
-
+          localAudioFile = extracted.audioFile;
+          const localId = `local_${Date.now()}`;
           currentVideoInfo = {
-            videoId: upData.video_id,
+            videoId: localId,
             filename: uploadedVideoFile.name,
-            savedName: upData.saved_name,
-            duration: upData.duration || metadata.duration,
-            videoUrl: metadata.objectUrl, // Direct local Blob URL for in-browser video playback!
-            filePath: upData.file_path,
-            width: metadata.width || upData.width || 1920,
-            height: metadata.height || upData.height || 1080,
+            savedName: localId,
+            duration: extracted.metadata.duration,
+            videoUrl: extracted.metadata.objectUrl,
+            filePath: '',
+            width: extracted.metadata.width,
+            height: extracted.metadata.height,
           };
           setUploadedVideoInfo(currentVideoInfo);
           setIsUploadingVideo(false);
-        } catch (uploadErr: any) {
+        } catch (localErr: any) {
           setIsUploadingVideo(false);
           setLoading(false);
-          setError(uploadErr.message || 'Failed to extract or upload audio');
+          setError(localErr.message || 'Gagal membaca audio dari video lokal.');
           return;
         }
       }
@@ -2492,122 +2451,167 @@ export default function App() {
     let resultData: AnalyzeResponse | null = null;
 
     try {
-      const userCookies = getStoredCookies();
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: abortCtrl.signal,
-        body: JSON.stringify({
-          url: targetAnalyzeUrl,
-          duration: durationPref,
-          api_key: apiProvider === 'gemini' ? (apiKey.trim() || undefined) : undefined,
-          model: apiProvider === 'gemini' ? selectedModel : undefined,
-          api_provider: apiProvider,
-          openrouter_key: apiProvider === 'openrouter' ? (openRouterKey.trim() || undefined) : undefined,
-          openrouter_model: apiProvider === 'openrouter' ? openRouterModel : undefined,
-          custom_prompt: customPrompt.trim() || undefined,
-          range_start: rangeStartSecs,
-          range_end: rangeEndSecs,
-          subtitles: subtitlesSource === 'manual' ? manualSubtitlesContent : undefined,
-          subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
-          transcript_language: subtitlesSource === 'youtube' ? transcriptLanguage : undefined,
-          target_clip_count: clipCountMode === 'auto' ? 'auto' : targetClipCount,
-          cookies: userCookies || undefined,
-        }),
-      });
-
-      if (!response.body) throw new Error('No response stream from server.');
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let streamDone = false;
-
-      while (!streamDone) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        // SSE events are separated by double newlines
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop() ?? '';
-
-        for (const part of parts) {
-          for (const line of part.split('\n')) {
-            if (!line.startsWith('data: ')) continue;
-            let event: any;
-            try { event = JSON.parse(line.slice(6)); } catch { continue; }
-
-            if (event.error) {
-              throw new Error(event.error);
-            } else if (event.done) {
-              resultData = event.result as AnalyzeResponse;
-              setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
-              setOverallProgress(100);
-              streamDone = true;
-              break;
-            } else {
-              if (event.step !== undefined) {
-                const s = Number(event.step);
-                setCurrentStep(s);
-                setStepProgress(prev => {
-                  const updated = { ...prev };
-                  for (let prevStep = 1; prevStep < s; prevStep++) {
-                    updated[prevStep] = 100;
-                  }
-                  if (event.step_progress !== undefined) {
-                    updated[s] = Math.max(updated[s] || 0, Number(event.step_progress));
-                  }
-                  return updated;
-                });
-              }
-              if (event.overall_progress !== undefined) {
-                setOverallProgress(Number(event.overall_progress));
-              }
-              if (event.stage) {
-                setAiStage(event.stage);
-              }
-              if (event.detail) {
-                setAiDetail(event.detail);
-              }
-              if (event.model) {
-                setActiveProcessingModel(event.model);
-              }
-              if (event.message) {
-                setLoadingDetails(event.message);
-              }
-            }
-          }
-          if (streamDone) break;
-        }
-      }
-
-      // Flush remaining data in decoder and parse trailing buffer
-      buffer += decoder.decode();
-      if (!resultData && buffer.trim()) {
-        const parts = buffer.split('\n\n');
-        for (const part of parts) {
-          for (const line of part.split('\n')) {
-            if (!line.startsWith('data: ')) continue;
-            try {
-              const event = JSON.parse(line.slice(6));
-              if (event.error) throw new Error(event.error);
-              if (event.done && event.result) {
+      if (sourceMode === 'upload' && uploadedVideoFile && localAudioFile && currentVideoInfo) {
+        setCurrentStep(3);
+        setStepProgress({ 1: 100, 2: 100, 3: 10, 4: 0 });
+        setOverallProgress(55);
+        const analysis = await analyzeLocalAudioWithGemini({
+          audioFile: localAudioFile,
+          apiKey: apiKey.trim(),
+          model: selectedModel,
+          durationSeconds: currentVideoInfo.duration,
+          clipDuration: durationPref,
+          targetClipCount: clipCountMode === 'auto' ? 'auto' : targetClipCount,
+          customPrompt,
+          signal: abortCtrl.signal,
+          onProgress: (message) => {
+            setAiStage('Gemini Local Audio Analysis');
+            setAiDetail(message);
+            setLoadingDetails(message);
+          },
+        });
+        const localHeatmap = Array.from({ length: Math.max(1, Math.ceil(currentVideoInfo.duration / 5)) }, (_, index) => ({
+          start_time: index * 5,
+          end_time: Math.min(currentVideoInfo.duration, (index + 1) * 5),
+          value: 0,
+        }));
+        resultData = {
+          video_id: currentVideoInfo.videoId,
+          title: currentVideoInfo.filename,
+          duration: currentVideoInfo.duration,
+          heatmap: localHeatmap,
+          summary: analysis.summary,
+          clips: analysis.clips,
+          transcript: analysis.transcript.map(line => ({
+            start: line.start,
+            end: line.end,
+            text: line.text,
+            engagement: 0,
+          })),
+          model: selectedModel + ' (direct)',
+          video_url: currentVideoInfo.videoUrl,
+          source_type: 'upload',
+        };
+        setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
+        setOverallProgress(100);
+      } else {
+        const userCookies = getStoredCookies();
+        const response = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: abortCtrl.signal,
+          body: JSON.stringify({
+            url: targetAnalyzeUrl,
+            duration: durationPref,
+            api_key: apiProvider === 'gemini' ? (apiKey.trim() || undefined) : undefined,
+            model: apiProvider === 'gemini' ? selectedModel : undefined,
+            api_provider: apiProvider,
+            openrouter_key: apiProvider === 'openrouter' ? (openRouterKey.trim() || undefined) : undefined,
+            openrouter_model: apiProvider === 'openrouter' ? openRouterModel : undefined,
+            custom_prompt: customPrompt.trim() || undefined,
+            range_start: rangeStartSecs,
+            range_end: rangeEndSecs,
+            subtitles: subtitlesSource === 'manual' ? manualSubtitlesContent : undefined,
+            subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
+            transcript_language: subtitlesSource === 'youtube' ? transcriptLanguage : undefined,
+            target_clip_count: clipCountMode === 'auto' ? 'auto' : targetClipCount,
+            cookies: userCookies || undefined,
+          }),
+        });
+  
+        if (!response.body) throw new Error('No response stream from server.');
+  
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamDone = false;
+  
+        while (!streamDone) {
+          const { done, value } = await reader.read();
+          if (done) break;
+  
+          buffer += decoder.decode(value, { stream: true });
+          // SSE events are separated by double newlines
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop() ?? '';
+  
+          for (const part of parts) {
+            for (const line of part.split('\n')) {
+              if (!line.startsWith('data: ')) continue;
+              let event: any;
+              try { event = JSON.parse(line.slice(6)); } catch { continue; }
+  
+              if (event.error) {
+                throw new Error(event.error);
+              } else if (event.done) {
                 resultData = event.result as AnalyzeResponse;
                 setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
                 setOverallProgress(100);
+                streamDone = true;
                 break;
+              } else {
+                if (event.step !== undefined) {
+                  const s = Number(event.step);
+                  setCurrentStep(s);
+                  setStepProgress(prev => {
+                    const updated = { ...prev };
+                    for (let prevStep = 1; prevStep < s; prevStep++) {
+                      updated[prevStep] = 100;
+                    }
+                    if (event.step_progress !== undefined) {
+                      updated[s] = Math.max(updated[s] || 0, Number(event.step_progress));
+                    }
+                    return updated;
+                  });
+                }
+                if (event.overall_progress !== undefined) {
+                  setOverallProgress(Number(event.overall_progress));
+                }
+                if (event.stage) {
+                  setAiStage(event.stage);
+                }
+                if (event.detail) {
+                  setAiDetail(event.detail);
+                }
+                if (event.model) {
+                  setActiveProcessingModel(event.model);
+                }
+                if (event.message) {
+                  setLoadingDetails(event.message);
+                }
               }
-            } catch (err: any) {
-              if (err.message && !err.message.includes('JSON')) throw err;
             }
+            if (streamDone) break;
           }
-          if (resultData) break;
         }
-      }
-
-      if (!resultData) {
-        throw new Error('Connection to the server was closed before analysis completed. On mobile devices, ensure your browser screen stays awake and network is stable, then try again.');
+  
+        // Flush remaining data in decoder and parse trailing buffer
+        buffer += decoder.decode();
+        if (!resultData && buffer.trim()) {
+          const parts = buffer.split('\n\n');
+          for (const part of parts) {
+            for (const line of part.split('\n')) {
+              if (!line.startsWith('data: ')) continue;
+              try {
+                const event = JSON.parse(line.slice(6));
+                if (event.error) throw new Error(event.error);
+                if (event.done && event.result) {
+                  resultData = event.result as AnalyzeResponse;
+                  setStepProgress({ 1: 100, 2: 100, 3: 100, 4: 100 });
+                  setOverallProgress(100);
+                  break;
+                }
+              } catch (err: any) {
+                if (err.message && !err.message.includes('JSON')) throw err;
+              }
+            }
+            if (resultData) break;
+          }
+        }
+  
+        if (!resultData) {
+          throw new Error('Connection to the server was closed before analysis completed. On mobile devices, ensure your browser screen stays awake and network is stable, then try again.');
+        }
       }
 
       // Cache the successful response safely (handling mobile Safari quota limits)
