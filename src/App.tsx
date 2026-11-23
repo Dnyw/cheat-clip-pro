@@ -2331,7 +2331,7 @@ export default function App() {
       setOverallProgress(5);
       setActiveProcessingModel(selectedModel);
 
-      if (!currentVideoInfo && uploadedVideoFile) {
+      if (uploadedVideoFile) {
         setIsUploadingVideo(true);
         setLoadingDetails('Membaca video lokal...');
         setAiStage('Extracting Audio Locally');
