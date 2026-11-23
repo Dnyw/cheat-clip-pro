@@ -2318,6 +2318,7 @@ export default function App() {
     let targetAnalyzeUrl = sourceMode === 'gdrive' ? gdriveUrl.trim() : (sourceMode === 'twitch' ? (twitchUrl.trim() || url.trim()) : url.trim());
     let videoId = extractVideoId(targetAnalyzeUrl);
     let currentVideoInfo = uploadedVideoInfo;
+    let localAudioFile: File | null = null;
 
     if (sourceMode === 'upload') {
       setLoading(true);
@@ -2330,7 +2331,6 @@ export default function App() {
       setOverallProgress(5);
       setActiveProcessingModel(selectedModel);
 
-      let localAudioFile: File | null = null;
       if (!currentVideoInfo && uploadedVideoFile) {
         setIsUploadingVideo(true);
         setLoadingDetails('Membaca video lokal...');
